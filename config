@@ -1,0 +1,13 @@
+[theme]
+base = "dark"
+primaryColor = "#7C8CFF"
+backgroundColor = "#0B0D12"
+secondaryBackgroundColor = "#151922"
+textColor = "#F3F4F6"
+borderColor = "#262C38"
+font = "IBM Plex Sans:https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap, sans-serif"
+baseRadius = "8px"
+
+[theme.sidebar]
+backgroundColor = "#11141B"
+secondaryBackgroundColor = "#1B202B"
