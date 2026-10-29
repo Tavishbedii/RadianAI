@@ -1,4 +1,4 @@
-import io, re, json, html, uuid, base64, difflib, datetime
+import io, os, re, json, html, uuid, base64, difflib, datetime
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
@@ -10,9 +10,12 @@ from google.genai import types
 # Settings
 # =====================================================================
 MODEL = "gemini-3.5-flash-lite"   # works on the free tier (checked with check_key.py)
-USE_GOOGLE_SEARCH = False         # True needs a Gemini plan that includes Google Search grounding
+USE_GOOGLE_SEARCH = os.getenv("USE_GOOGLE_SEARCH", "false").lower() == "true"    # True needs a Gemini plan that includes Google Search grounding
+OFFLINE_FALLBACK = os.getenv("OFFLINE_FALLBACK", "true").lower() == "true"    # use Radian AI's own verifier when Gemini fails
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
+VIDEO_TYPES = ["mp4", "mov", "webm", "m4v", "mkv"]
+GEMINI_VIDEO_LIMIT_MB = 18   # larger videos are sent to Gemini as extracted text only
 
 TEAM = [("Shubham", "Backend & bot"), ("Siddharth", "OCR"),
         ("Tavish", "AI model"), ("Swayam", "Frontend")]
@@ -41,6 +44,10 @@ DEFAULTS = {
     "up_key": 0,            # bumping this resets the upload widget
     "up_seen": None,        # last file seen in the upload widget
     "img_result_id": None,  # id of the result shown in the screenshot tab
+    "vid": None,            # the video being checked: {bytes, name, type, size, fid}
+    "vid_up_key": 0,        # bumping this resets the video upload widget
+    "vid_seen": None,       # last video seen in the upload widget
+    "vid_result_id": None,  # id of the result shown in the video tab
     "txt_result_id": None,  # id of the result shown in the message tab
     "msg_saved": "",        # message text, kept when switching pages
     "msg_invalid": False,
@@ -202,7 +209,8 @@ def ask_gemini(image_bytes, mime, text):
     parts = []
     if image_bytes:
         parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime))
-    prompt = (PROMPT.replace("{source}", "screenshot" if image_bytes else "pasted message")
+    prompt = (PROMPT.replace("{source}", "video" if (mime or "").startswith("video")
+                                     else "screenshot" if image_bytes else "pasted message")
                     .replace("{text}", text or "(none)"))
     if not USE_GOOGLE_SEARCH:
         prompt = prompt.replace("Use Google Search to check it against", "Check it using what you know about")
@@ -259,6 +267,8 @@ def clean(r):
 
 def friendly_error(e):
     msg = str(e)
+    if "offline verifier" in msg:
+        return msg
     if "API key" in msg or "401" in msg or "403" in msg or "PERMISSION" in msg:
         return "The Gemini API key is missing or not valid. Check GEMINI_API_KEY in your .env file, then restart the app."
     if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
@@ -388,6 +398,14 @@ def remove_image():
     st.session_state.errors.pop("img", None)
 
 
+def remove_video():
+    st.session_state.vid = None
+    st.session_state.vid_result_id = None
+    st.session_state.vid_seen = None
+    st.session_state.vid_up_key += 1
+    st.session_state.errors.pop("vid", None)
+
+
 def open_result(rid):
     st.session_state.page = "history"
     st.session_state.open_id = rid
@@ -413,7 +431,9 @@ def clear_history():
 # =====================================================================
 def run_pipeline(mode):
     image = st.session_state.img if mode == "img" else None
-    text = "" if mode == "img" else st.session_state.msg_saved.strip()
+    video = st.session_state.vid if mode == "vid" else None
+    text = st.session_state.msg_saved.strip() if mode == "txt" else ""
+    offline_text = None
 
     with st.status("Analyzing the claim and checking available evidence...", expanded=True) as status:
         if image:
@@ -424,21 +444,68 @@ def run_pipeline(mode):
                          else "OCR found no readable text, so the AI will read the image directly")
             else:
                 st.write("OCR is turned off, so the AI will read the image directly")
-        st.write("Identifying the claim and searching reliable sources")
-        try:
-            r = clean(dict(ask_gemini(image["bytes"] if image else None,
-                                      image["type"] if image else None, text)))
-        except Exception as e:
-            status.update(label="Verification failed", state="error", expanded=False)
-            return None, e
+        if video:
+            st.write("Reading the video: speech to text (Whisper) and on-screen text (OCR on frames). "
+                     "The first run downloads the speech model and can take a few minutes.")
+            try:
+                from video_reader import read_video
+                info = read_video(video["bytes"], video["name"], st.session_state.get("use_ocr", True))
+            except Exception as e:
+                status.update(label="Verification failed", state="error", expanded=False)
+                return None, e
+            text = info["combined"]
+            offline_text = ". ".join(x for x in (info["on_screen"], info["transcript"]) if x)
+            for note in info["notes"]:
+                st.write(note)
+            st.write(f"Transcribed {len(info['transcript'].split())} spoken words and found "
+                     f"{len(info['on_screen'].split())} words of on-screen text")
+        r, gemini_error = None, None
+        if st.session_state.get("offline_only"):
+            st.write("Offline mode is on, so Gemini is skipped")
+        else:
+            st.write("Identifying the claim and searching reliable sources")
+            try:
+                media_bytes, media_type = None, None
+                if image:
+                    media_bytes, media_type = image["bytes"], image["type"]
+                elif video and video["size"] <= GEMINI_VIDEO_LIMIT_MB * 1024 * 1024:
+                    media_bytes, media_type = video["bytes"], video["type"]
+                if video and not media_bytes and not text:
+                    raise ValueError("No speech or text could be read from this video, and it is too "
+                                     f"large to send to Gemini (over {GEMINI_VIDEO_LIMIT_MB} MB).")
+                r = clean(dict(ask_gemini(media_bytes, media_type, text)))
+                r["engine"] = f"Gemini ({MODEL})"
+            except Exception as e:
+                gemini_error = e
+                st.write(f"Gemini unavailable: {friendly_error(e)}")
+
+        if r is None:
+            if not (OFFLINE_FALLBACK or st.session_state.get("offline_only")):
+                status.update(label="Verification failed", state="error", expanded=False)
+                return None, gemini_error
+            check_text = offline_text if video else text
+            if not check_text:
+                status.update(label="Verification failed", state="error", expanded=False)
+                return None, gemini_error or ValueError(
+                    "The offline verifier needs readable text. Paste the message text, or turn on OCR "
+                    "in Advanced options for screenshots and videos.")
+            st.write("Switching to Radian AI's offline verifier: cleaning the claim, searching news and "
+                     "Wikipedia, and checking each source with the NLI model "
+                     "(the first run loads the model and can take a minute)")
+            try:
+                from offline_check import offline_check
+                r = clean(offline_check(check_text, from_screenshot=bool(image or video)))
+            except Exception as e:
+                status.update(label="Verification failed", state="error", expanded=False)
+                return None, gemini_error or e
         status.update(label=f"Verification complete: {r['assessment']}", state="complete", expanded=False)
 
     now = datetime.datetime.now()
     rid = "RV-" + uuid.uuid4().hex[:6].upper()
     similar = find_similar(text, r.get("claim"))
     r.update({"id": rid, "time": now.strftime("%d %b %Y, %I:%M %p"),
-              "input_text": text, "input_type": "Screenshot" if image else "Message",
-              "used_ocr": bool(image) and bool(text), "feedback": None,
+              "input_text": text, "input_type": "Video" if video else "Screenshot" if image else "Message",
+              "used_ocr": bool(image or video) and bool(text), "feedback": None,
               "similar_to": similar["id"] if similar else None})
     st.session_state.history.insert(0, r)
     return r, None
@@ -450,6 +517,9 @@ def process_job(mode):
     if not job or job["mode"] != mode:
         return
     if mode == "img" and not st.session_state.img:
+        st.session_state.job = None
+        return
+    if mode == "vid" and not st.session_state.vid:
         st.session_state.job = None
         return
     try:
@@ -521,7 +591,7 @@ def render_result(r, ctx):
 
     # Duplicate-claim notice
     earlier = get_item(r.get("similar_to")) if r.get("similar_to") else None
-    if earlier and ctx in ("img", "txt"):
+    if earlier and ctx in ("img", "vid", "txt"):
         st.info(f"You checked a very similar claim earlier ({earlier['time']}, verdict: {earlier['assessment']}). "
                 "An earlier verdict isn't proof that it still holds.", icon=":material/history:")
         c1, c2 = st.columns(2)
@@ -533,12 +603,14 @@ def render_result(r, ctx):
     st.markdown('<div class="section-title">Claim identified</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="claim">{e(r["claim"])}</div>', unsafe_allow_html=True)
     if r.get("input_text"):
-        label = ("Text extracted by OCR (before AI interpretation)" if r["input_type"] == "Screenshot"
-                 else "Message you submitted")
+        label = {"Screenshot": "Text extracted by OCR (before AI interpretation)",
+                 "Video": "Speech and on-screen text extracted from the video"}.get(
+                     r["input_type"], "Message you submitted")
         with st.expander(label):
             st.text(r["input_text"])
-    elif r["input_type"] == "Screenshot":
-        st.caption("No OCR text was used. The AI read the claim directly from the image.")
+    elif r["input_type"] in ("Screenshot", "Video"):
+        st.caption(f"No extracted text was used. The AI read the claim directly from the "
+                   f"{r['input_type'].lower()}.")
 
     # C. Explanation
     if r["reasoning"]:
@@ -586,7 +658,9 @@ def render_result(r, ctx):
                    "redirect to the original site. Whether each source supports or contradicts the claim "
                    "is described in the evidence analysis, not per source.")
     else:
-        reason = ("Live web search is switched off in this version, so the verdict is based on the AI model's "
+        reason = ("The offline verifier found no matching news or Wikipedia sources."
+                  if r.get("engine", "").startswith("Offline") else
+                  "Live web search is switched off in this version, so the verdict is based on the AI model's "
                   "own knowledge." if not USE_GOOGLE_SEARCH else "No web sources were returned for this check.")
         st.info(reason + " Treat it with extra caution, especially for very recent news.",
                 icon=":material/link_off:")
@@ -595,6 +669,7 @@ def render_result(r, ctx):
     st.markdown(
         f'<dl class="meta"><div><dt>Checked</dt><dd>{e(r["time"])}</dd></div>'
         f'<div><dt>Input</dt><dd>{e(r["input_type"])}</dd></div>'
+        f'<div><dt>Checked by</dt><dd>{e(r.get("engine", "Gemini"))}</dd></div>'
         f'<div><dt>Verification ID</dt><dd>{e(r["id"])}</dd></div></dl>',
         unsafe_allow_html=True)
 
@@ -618,13 +693,16 @@ def render_result(r, ctx):
     if ctx == "img":
         st.button("Check another screenshot", key="another_img", icon=":material/add_photo_alternate:",
                   on_click=remove_image, type="secondary")
+    elif ctx == "vid":
+        st.button("Check another video", key="another_vid", icon=":material/video_library:",
+                  on_click=remove_video, type="secondary")
     elif ctx == "txt":
         st.button("Check another message", key="another_txt", icon=":material/edit_note:",
                   on_click=clear_message, type="secondary")
 
     if st.session_state.get("tech"):
         with st.expander("Technical details"):
-            st.write(f"Model: `{MODEL}`")
+            st.write(f"Checked by: `{r.get('engine', MODEL)}`")
             st.json({k: r.get(k) for k in ("id", "assessment", "confidence", "claim", "evidence_for",
                                            "evidence_against", "missing_context", "red_flags", "sources")})
 
@@ -647,6 +725,8 @@ with st.sidebar:
     with st.expander("Advanced options", icon=":material/tune:"):
         st.toggle("Read text with OCR (Tesseract)", value=True, key="use_ocr",
                   help="Turn off to let the AI read screenshots directly without OCR.")
+        st.toggle("Offline mode (skip Gemini)", value=False, key="offline_only",
+                  help="Check claims with Radian AI's own offline verifier instead of Gemini.")
         st.toggle("Show technical details", value=False, key="tech",
                   help="Shows the model name, raw result fields and error details.")
 
@@ -683,7 +763,8 @@ busy = st.session_state.job is not None
 # Page: New verification
 # =====================================================================
 def page_verify():
-    tab_img, tab_txt = st.tabs([":material/image: Check a screenshot", ":material/chat: Check a message"])
+    tab_img, tab_vid, tab_txt = st.tabs([":material/image: Check a screenshot", ":material/videocam: Check a video",
+                                         ":material/chat: Check a message"])
 
     # ---------------- Screenshot ----------------
     with tab_img:
@@ -756,6 +837,65 @@ def page_verify():
                             "will appear here.")
             else:
                 empty_state("No screenshot yet", "Upload a screenshot to get started.")
+
+    # ---------------- Video ----------------
+    with tab_vid:
+        vid = st.session_state.vid
+        r = get_item(st.session_state.vid_result_id)
+        if r:
+            extract = "done" if r.get("used_ocr") else "skipped"
+        else:
+            extract = "current" if vid else "todo"
+        later = "done" if r else "todo"
+        step_bar([("Upload", "done" if vid else "current"), ("Extract speech & text", extract),
+                  ("Analyze claim", later), ("Check sources", later), ("Verdict", "current" if r else "todo")])
+
+        left, right = st.columns([1, 1.45], gap="large")
+        with left:
+            st.markdown('<div class="panel-title">Upload a video</div>'
+                        '<p class="panel-help">A news clip, reel or forwarded video, up to 5 minutes. '
+                        'Radian AI reads what is said and shown, then checks those claims. '
+                        'It does not detect deepfakes.</p>', unsafe_allow_html=True)
+            f = st.file_uploader("Upload a video", type=VIDEO_TYPES, key=f"vid_uploader_{st.session_state.vid_up_key}",
+                                 label_visibility="collapsed", disabled=busy,
+                                 help="MP4, MOV, WEBM, M4V or MKV")
+            if f is not None:
+                fid = f"{f.name}-{f.size}"
+                if st.session_state.vid_seen != fid:
+                    st.session_state.vid_seen = fid
+                    st.session_state.vid = {"bytes": f.getvalue(), "name": f.name,
+                                            "type": f.type or "video/mp4", "size": f.size, "fid": fid}
+                    st.session_state.vid_result_id = None
+                    st.session_state.errors.pop("vid", None)
+                    st.rerun()
+            elif st.session_state.vid_seen is not None:
+                remove_video()
+                st.rerun()
+
+            vid = st.session_state.vid
+            if vid:
+                st.video(vid["bytes"])
+                st.caption(f"{html.escape(vid['name'])} ({vid['size'] / (1024 * 1024):,.1f} MB)")
+                st.button("Remove video", key="remove_vid", icon=":material/close:", type="tertiary",
+                          on_click=remove_video, disabled=busy)
+
+            st.button("Analyze video", key="btn_vid", type="primary", icon=":material/search:",
+                      width="stretch", disabled=busy or not vid, on_click=queue, args=("vid",))
+            if not vid:
+                st.caption("Upload a video to enable analysis.")
+
+        with right:
+            process_job("vid")
+            r = get_item(st.session_state.vid_result_id)
+            if show_error("vid"):
+                pass
+            elif r:
+                render_result(r, "vid")
+            elif vid:
+                empty_state("Ready to analyze", "Click <i>Analyze video</i>. Reading the speech and on-screen "
+                            "text can take a minute or two.")
+            else:
+                empty_state("No video yet", "Upload a video to get started.")
 
     # ---------------- Message ----------------
     with tab_txt:
@@ -863,12 +1003,16 @@ def page_about():
 
     st.markdown('<div class="section-title">How a check works</div>', unsafe_allow_html=True)
     st.markdown(
-        "1. **Upload** a screenshot or paste a message.\n"
+        "1. **Upload** a screenshot or video, or paste a message.\n"
         "2. **Extract text** from screenshots with Tesseract OCR (English and Hindi).\n"
         "3. **Analyze the claim** with Google Gemini.\n"
         "4. **Check sources** using Google Search, with priority for fact-checkers such as PIB Fact Check, "
         "Alt News and BOOM (when live search is enabled).\n"
-        "5. **Verdict** with reasons, evidence, warning signs and the sources retrieved.")
+        "5. **Verdict** with reasons, evidence, warning signs and the sources retrieved.\n\n"
+        "If Gemini is unavailable (for example, the free-tier limit is reached), Radian AI switches to its "
+        "**offline verifier**: it rewrites the message as a clear claim, finds evidence in recent news "
+        "and Wikipedia, checks each source with a Natural Language Inference model, and adds a signal "
+        "from our own trained writing-style model.")
 
     st.markdown('<div class="section-title">What the verdicts mean</div>', unsafe_allow_html=True)
     for label, v in VERDICT.items():
@@ -878,6 +1022,8 @@ def page_about():
     st.markdown(
         "- The AI can be wrong, especially about very recent events or local news with little coverage.\n"
         "- OCR can misread low-quality, stylised or dark-mode screenshots.\n"
+        "- For videos, Radian AI checks the claims that are spoken or shown on screen. It does not "
+        "detect deepfakes or edited footage.\n"
         "- Confidence is the AI's own estimate, not a measured accuracy rate.\n"
         "- History is kept only for the current browser session.")
 
