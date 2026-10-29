@@ -3,6 +3,15 @@ import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
 load_dotenv()
+
+# On Streamlit Community Cloud the settings come from the app's Secrets, not a .env file.
+# Copy them into the environment so the rest of the app (and the Gemini client) can read them.
+try:
+    for _key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "USE_GOOGLE_SEARCH", "OFFLINE_FALLBACK", "WHISPER_MODEL"):
+        if _key in st.secrets and not os.getenv(_key):
+            os.environ[_key] = str(st.secrets[_key])
+except Exception:
+    pass   # no secrets file (normal on a laptop that uses .env)
 from google import genai
 from google.genai import types
 
@@ -273,7 +282,8 @@ def friendly_error(e):
     if "offline verifier" in msg:
         return msg
     if "API key" in msg or "401" in msg or "403" in msg or "PERMISSION" in msg:
-        return "The Gemini API key is missing or not valid. Check GEMINI_API_KEY in your .env file, then restart the app."
+        return ("The Gemini API key is missing or not valid. Check GEMINI_API_KEY in your .env file "
+                "(or in the app's Secrets when deployed), then restart the app.")
     if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
         return "The free-tier limit was reached. Wait a minute and try again."
     if "404" in msg or "not found" in msg.lower():
