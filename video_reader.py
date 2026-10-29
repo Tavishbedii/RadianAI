@@ -104,6 +104,10 @@ def read_video(video_bytes, filename="video.mp4", use_ocr=True):
             transcript, language = transcribe(path)
             if language and language != "en":
                 notes.append(f"Speech detected in '{language}' and translated to English")
+        except ModuleNotFoundError:
+            transcript = ""
+            notes.append("Speech-to-text runs on the full version of Radian AI; "
+                         "Gemini will listen to the video directly")
         except Exception as e:
             transcript = ""
             notes.append(f"Speech could not be read ({type(e).__name__})")
