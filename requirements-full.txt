@@ -1,0 +1,15 @@
+streamlit
+pillow
+python-dotenv
+google-genai
+scikit-learn
+pandas
+joblib
+transformers
+torch
+sentencepiece
+protobuf
+requests
+pytesseract
+faster-whisper
+opencv-python-headless

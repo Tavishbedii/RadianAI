@@ -1,4 +1,4 @@
-import io, os, re, json, html, uuid, base64, difflib, datetime
+import io, os, re, json, html, uuid, base64, difflib, datetime, importlib.util
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
@@ -12,7 +12,10 @@ from google.genai import types
 MODEL = "gemini-3.5-flash-lite"   # works on the free tier (checked with check_key.py)
 USE_GOOGLE_SEARCH = os.getenv("USE_GOOGLE_SEARCH", "false").lower() == "true"    # True needs a Gemini plan that includes Google Search grounding
 OFFLINE_FALLBACK = os.getenv("OFFLINE_FALLBACK", "true").lower() == "true"    # use Radian AI's own verifier when Gemini fails
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_PATH = os.getenv("TESSERACT_PATH") or (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == "nt" else "tesseract")
+# The offline verifier needs PyTorch + Transformers. The online (lite) deployment leaves them out.
+OFFLINE_AVAILABLE = all(importlib.util.find_spec(m) for m in ("torch", "transformers"))
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 VIDEO_TYPES = ["mp4", "mov", "webm", "m4v", "mkv"]
 GEMINI_VIDEO_LIMIT_MB = 18   # larger videos are sent to Gemini as extracted text only
@@ -483,7 +486,7 @@ def run_pipeline(mode):
                 st.write(f"Gemini unavailable: {friendly_error(e)}")
 
         if r is None:
-            if not (OFFLINE_FALLBACK or st.session_state.get("offline_only")):
+            if not OFFLINE_AVAILABLE or not (OFFLINE_FALLBACK or st.session_state.get("offline_only")):
                 status.update(label="Verification failed", state="error", expanded=False)
                 return None, gemini_error
             check_text = offline_text if video else text
@@ -731,8 +734,10 @@ with st.sidebar:
     with st.expander("Advanced options", icon=":material/tune:"):
         st.toggle("Read text with OCR (Tesseract)", value=True, key="use_ocr",
                   help="Turn off to let the AI read screenshots directly without OCR.")
-        st.toggle("Offline mode (skip Gemini)", value=False, key="offline_only",
-                  help="Check claims with Radian AI's own offline verifier instead of Gemini.")
+        st.toggle("Offline mode (skip Gemini)", value=False, key="offline_only", disabled=not OFFLINE_AVAILABLE,
+                  help="Check claims with Radian AI's own offline verifier instead of Gemini."
+                       if OFFLINE_AVAILABLE else
+                       "The offline verifier runs on the full local install. This online version uses Gemini only.")
         st.toggle("Show technical details", value=False, key="tech",
                   help="Shows the model name, raw result fields and error details.")
 

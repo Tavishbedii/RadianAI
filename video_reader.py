@@ -14,7 +14,8 @@ import os
 import re
 import tempfile
 
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_PATH = os.getenv("TESSERACT_PATH") or (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == "nt" else "tesseract")
 WHISPER_SIZE = os.getenv("WHISPER_MODEL", "base")   # tiny / base / small (bigger = slower, more accurate)
 MAX_SECONDS = 300          # videos longer than 5 minutes are rejected
 FRAME_EVERY = 3            # seconds between frames read with OCR
