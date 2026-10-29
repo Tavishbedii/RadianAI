@@ -51,7 +51,7 @@ DEFAULTS = {
     "txt_result_id": None,  # id of the result shown in the message tab
     "msg_saved": "",        # message text, kept when switching pages
     "msg_invalid": False,
-    "job": None,            # a verification waiting to run: {"mode": "img"|"txt", "fresh": bool}
+    "job": None,            # a verification waiting to run: {"mode": "img"|"vid"|"txt", "fresh": bool}
     "errors": {},           # last error per mode
     "open_id": None,        # history item opened in full
 }
@@ -358,6 +358,7 @@ def go(page):
     st.session_state.page = page
     st.session_state.open_id = None
     st.session_state.up_seen = None      # upload widget resets on page change; keep the saved image
+    st.session_state.vid_seen = None     # same for the saved video
 
 
 def queue(mode, fresh=False):
@@ -410,6 +411,7 @@ def open_result(rid):
     st.session_state.page = "history"
     st.session_state.open_id = rid
     st.session_state.up_seen = None
+    st.session_state.vid_seen = None
 
 
 def set_feedback(rid, value):
@@ -423,6 +425,7 @@ def clear_history():
     st.session_state.history = []
     st.session_state.img_result_id = None
     st.session_state.txt_result_id = None
+    st.session_state.vid_result_id = None
     st.session_state.open_id = None
 
 
@@ -570,7 +573,7 @@ def show_error(mode):
 
 
 def render_result(r, ctx):
-    """ctx is 'img', 'txt' or 'hist'. Everything shown comes from the stored result."""
+    """ctx is 'img', 'vid', 'txt' or 'hist'. Everything shown comes from the stored result."""
     e = html.escape
     v = VERDICT[r["assessment"]]
     p = pct(r)
@@ -654,9 +657,12 @@ def render_result(r, ctx):
                          f'<a href="{e(s["url"], quote=True)}" target="_blank" rel="noopener noreferrer">'
                          f'Open original page<span class="sr"> (opens in a new tab)</span></a></div>')
         st.markdown(f'<div class="src-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
-        st.caption("These are the pages the AI retrieved with Google Search. Links pass through Google's "
-                   "redirect to the original site. Whether each source supports or contradicts the claim "
-                   "is described in the evidence analysis, not per source.")
+        if r.get("engine", "").startswith("Offline"):
+            st.caption("These are the news headlines and Wikipedia pages the offline verifier used as evidence.")
+        else:
+            st.caption("These are the pages the AI retrieved with Google Search. Links pass through Google's "
+                       "redirect to the original site. Whether each source supports or contradicts the claim "
+                       "is described in the evidence analysis, not per source.")
     else:
         reason = ("The offline verifier found no matching news or Wikipedia sources."
                   if r.get("engine", "").startswith("Offline") else
@@ -753,7 +759,7 @@ with st.sidebar:
 st.markdown(
     '<header><div class="app-header"><h1 class="app-title">Radian AI</h1>'
     '<span class="ai-badge">AI-ASSISTED VERIFICATION</span></div>'
-    '<p class="app-sub">Verify news, screenshots, and forwarded messages with evidence-based AI assistance.</p>'
+    '<p class="app-sub">Verify forwarded messages, screenshots and videos with evidence-based AI assistance.</p>'
     '</header>', unsafe_allow_html=True)
 
 busy = st.session_state.job is not None
@@ -997,14 +1003,15 @@ def page_history():
 # =====================================================================
 def page_about():
     st.markdown('<div class="panel-title">About Radian AI</div>', unsafe_allow_html=True)
-    st.write("Radian AI helps people check screenshots and forwarded messages before they share them. "
+    st.write("Radian AI helps people check forwarded messages, screenshots and videos before they share them. "
              "It reads the text, identifies the main claim, searches reliable sources and explains its verdict, "
              "so you can see the reasoning instead of trusting an unexplained answer.")
 
     st.markdown('<div class="section-title">How a check works</div>', unsafe_allow_html=True)
     st.markdown(
         "1. **Upload** a screenshot or video, or paste a message.\n"
-        "2. **Extract text** from screenshots with Tesseract OCR (English and Hindi).\n"
+        "2. **Extract text** from screenshots with Tesseract OCR (English and Hindi), and from videos "
+        "with Whisper speech-to-text plus OCR on frames.\n"
         "3. **Analyze the claim** with Google Gemini.\n"
         "4. **Check sources** using Google Search, with priority for fact-checkers such as PIB Fact Check, "
         "Alt News and BOOM (when live search is enabled).\n"
@@ -1029,7 +1036,8 @@ def page_about():
 
     st.markdown('<div class="section-title">Project team</div>', unsafe_allow_html=True)
     st.markdown("\n".join(f"- **{n}**: {r}" for n, r in TEAM))
-    st.caption("Built with Streamlit, Tesseract OCR and the Google Gemini API.")
+    st.caption("Built with Streamlit, the Google Gemini API, Tesseract OCR, faster-whisper, Hugging Face "
+               "Transformers and scikit-learn.")
 
 
 {"verify": page_verify, "history": page_history, "about": page_about}[st.session_state.page]()
